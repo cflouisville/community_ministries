@@ -1,0 +1,1131 @@
+---
+title: "Allocating Community Ministry Resources"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+date: "2024-04-22"
+---
+```{r setup, include=FALSE}
+library(glptools)
+glp_load_packages(T)
+
+library(sf)
+library(ipumsr)
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, 
+                      dev.args=list(bg="transparent"), fig.width=9, fig.height=6) 
+```
+
+# What's the deal?
+
+We want to be able to ask questions about the areas our Community Ministries serve. How many evictions happened in SLCM's service area? How many shutoffs happened in Central Louisville's service area?
+
+That data usually comes to us in tables grouped by zip code. Many Community Ministry boundaries line up with zip codes--but not all of them. Some zip codes are split across multiple community ministries.
+
+This is my walkthrough of figuring out whether using that data to understand Community Ministries will cause any problems.
+
+```{r load_data}
+
+path <- "C:/Users/harrisonk/OneDrive - The Community Foundation of Louisville, Inc/Documents/R/glptools/data-raw/council_tract/"
+
+map_block <- st_read(path %p% "nhgis0021_shapefile_tl2020_210_block_2020", quiet = TRUE)
+block_population <- read_nhgis(path %p% "nhgis0021_csv.zip")
+
+ministries <- st_read("Jefferson_County_KY_Community_Ministries_Areas", quiet = TRUE)
+
+zip_codes <- map_zip %>%
+  filter(!is.na(zip)) %>%
+  group_by(zip) %>%
+  summarize()
+
+block_proj <- st_transform(map_block, 3857)
+ministries %<>% st_transform(3857)
+zip_codes %<>% st_transform(3857)
+
+# Create block population
+block_proj %<>%
+  filter(COUNTYFP20 == "111") %>%
+  st_make_valid() %>%
+  left_join(block_population, by = "GISJOIN") %>%
+  transmute(
+    tract = paste0(STATEFP20, COUNTYFP20, TRACTCE20),
+    block_group = paste0(tract, str_sub(BLOCKCE20, 1, 1)),
+    block = paste0(tract, BLOCKCE20),
+    population = U7H001)
+
+block_population %<>%
+  transmute(
+    tract = paste0(STATEA, COUNTYA, TRACTA),
+    block_group = paste0(tract, str_sub(BLKGRPA, 1, 1)),
+    block = paste0(tract, BLOCKA),
+    population = U7H001)
+
+ministries %<>%
+  transmute(
+    ministry = str_to_title(NAME),
+    abbreviation = ABBR) %>%
+  mutate(
+    ministry = if_else(ministry == "Jeffersontown  Area Ministries", "Jeffersontown Area Ministries", ministry))
+
+```
+
+
+```{r get_overlap}
+#block_snap_to_zip <- st_snap(block_proj, zip_codes, tolerance = 3.3) %>%
+#  st_make_valid()
+
+block_zip <- st_intersection(block_proj, zip_codes)
+
+block_zip_ministry <- st_intersection(block_zip, ministries)
+
+block_zip_ministry %<>%
+  select(block, block_group, tract, 
+         zip, 
+         ministry,
+         population,
+         geometry)
+
+```
+
+```{r summarize_data}
+
+block_zip_ministry_sum <- block_zip_ministry %>%
+  mutate(area    = st_area(.)) %>%
+  st_drop_geometry() %>%
+  group_by(block) %>%
+  transmute(
+    ministry,
+    zip,
+    area,
+    population,
+    block_in_here = as.numeric(area / sum(area)),
+    people_in_here = block_in_here * population) %>%
+  ungroup()
+
+zip_ministry <- block_zip_ministry_sum %>%
+  group_by(zip, ministry) %>%
+  filter(people_in_here >= 1) %>%
+  reframe(people = sum(people_in_here)) %>%
+  group_by(zip) %>%
+  mutate(zip_pct_in_ministry = people / sum(people)) %>%
+  ungroup()
+
+```
+
+# What does the overlap look like?
+
+## CM Areas
+
+This map shows Louisville's Community Ministry Service areas. You can click the box in the top right to toggle the labels on and off.
+
+```{r show_CM}
+
+zip_explanation <- zip_ministry %>%
+  group_by(zip) %>%
+  nest()
+
+labels <- list()
+zips <- c()
+
+for(i in 1:nrow(zip_explanation)) {
+  
+  this_df <- zip_explanation[i,][["data"]] %>% as.data.frame()
+  
+  num_rows <- nrow(this_df)
+  
+  line1 = "Zip code " %p% zip_explanation$zip[i]
+  
+  if (num_rows == 1) {
+    
+    lab <- sprintf("%s<br/>%s",
+                line1,
+                scales::percent(this_df[1,"zip_pct_in_ministry"]) %p% " or " %p% scales::comma(this_df[1,"people"]) %p% " people in " %p% str_to_title(this_df[1,"ministry"]))
+    
+  } else if (num_rows == 2) {
+    
+    lab <- sprintf("%s<br/>%s<br/>%s",
+                line1,
+                scales::percent(this_df[1,"zip_pct_in_ministry"]) %p% " or " %p% scales::comma(this_df[1,"people"]) %p% " people in " %p% str_to_title(this_df[1,"ministry"]),
+                scales::percent(this_df[2,"zip_pct_in_ministry"]) %p% " or " %p% scales::comma(this_df[2,"people"]) %p% " people in " %p% str_to_title(this_df[2,"ministry"]))
+  
+  } else if (num_rows == 3) {
+    
+    lab <- sprintf("%s<br/>%s<br/>%s<br/>%s",
+                line1,
+                scales::percent(this_df[1,"zip_pct_in_ministry"]) %p% " or " %p% scales::comma(this_df[1,"people"]) %p% " people in " %p% str_to_title(this_df[1,"ministry"]),
+                scales::percent(this_df[2,"zip_pct_in_ministry"]) %p% " or " %p% scales::comma(this_df[2,"people"]) %p% " people in " %p% str_to_title(this_df[2,"ministry"]),
+                scales::percent(this_df[3,"zip_pct_in_ministry"]) %p% " or " %p% scales::comma(this_df[3,"people"]) %p% " people in " %p% str_to_title(this_df[3,"ministry"]))
+  
+  } else if (num_rows == 4) {
+    
+    lab <- sprintf("%s<br/>%s<br/>%s<br/>%s<br/>%s",
+                line1,
+                scales::percent(this_df[1,"zip_pct_in_ministry"]) %p% " or " %p% scales::comma(this_df[1,"people"]) %p% " people in " %p% str_to_title(this_df[1,"ministry"]),
+                scales::percent(this_df[2,"zip_pct_in_ministry"]) %p% " or " %p% scales::comma(this_df[2,"people"]) %p% " people in " %p% str_to_title(this_df[2,"ministry"]),
+                scales::percent(this_df[3,"zip_pct_in_ministry"]) %p% " or " %p% scales::comma(this_df[3,"people"]) %p% " people in " %p% str_to_title(this_df[3,"ministry"]),
+                scales::percent(this_df[4,"zip_pct_in_ministry"]) %p% " or " %p% scales::comma(this_df[4,"people"]) %p% " people in " %p% str_to_title(this_df[4,"ministry"]))
+  
+  }
+  
+  #lapply(htmltools::HTML)
+  
+  labels <- c(labels, lab)
+  zips <- c(zips, zip_explanation$zip[i])
+    
+}
+
+
+zip_codes$label <- labels %>% lapply(htmltools::HTML)
+
+zip_ministry_count <- zip_ministry %>%
+  group_by(zip) %>%
+  reframe(n=n())
+
+zip_codes %<>%
+  left_join(zip_ministry_count, by = "zip")
+
+zip_codes %<>% st_transform(4326)
+ministries %<>% st_transform(4326)
+
+blues <- RColorBrewer::brewer.pal(8, "Blues")
+
+these_shades <- colorRampPalette(c(blues[3], blues[8]))(13)
+
+single_zips <- zip_codes %>% filter(n==1)
+multi_zips <- zip_codes %>% filter(n>1)
+
+ministry_labels <- ministries$ministry %>%
+  str_to_title() %>% 
+  str_wrap(20) %>%
+  str_replace_all("\n", "<br/>") %>%
+  lapply(htmltools::HTML)
+
+leaflet() %>%
+  addPolygons(data = ministries, color = these_shades, fillColor = these_shades, fillOpacity = 0.8, weight = 4) %>%
+  addLabelOnlyMarkers(data = st_centroid(ministries), label = ministry_labels,
+                      group = "CM Labels",
+                      labelOptions = labelOptions(
+                        style = list("font-weight" = "bold", "font-family" = "Arial", color = "white"),
+                        noHide = TRUE,
+                        textOnly = TRUE,
+                        direction = "center",
+                        opacity = 1)) %>%
+  addLayersControl(overlayGroups = c("CM Labels"),
+                   options = layersControlOptions(collapsed = F)) %>%
+  addTiles()
+
+pick_a_zip <- function(zip_code) {
+  
+  these_zips <- zip_codes %>% filter(zip %in% zip_code)
+  
+  leaflet() %>%
+    addPolygons(data = ministries, color = these_shades, fillColor = these_shades, fillOpacity = 0.8, weight = 4) %>% 
+    addPolygons(data = these_zips, color = "red", fillOpacity = 0.25, weight = 2, 
+                label = these_zips$label) %>%
+    addTiles()
+}
+
+
+```
+
+## CM Areas and zip codes
+
+Here are the CM areas with zip codes laid on top of them.
+
+The green zip codes are fully "contained" within one Community Ministry. (They're green because they are cooperative and easy to use.)
+
+The red zip codes are divided across multiple Community Ministry service areas. (They're red because they pose some problems.)
+
+Again, you can use the box in the top right to toggle things on and off to see how things overlap.
+
+```{r}
+
+leaflet() %>%
+  addPolygons(data = ministries, color = these_shades, fillColor = these_shades, fillOpacity = 0.8, weight = 4) %>%
+  addLabelOnlyMarkers(data = st_centroid(ministries), label = ministry_labels,
+                      group = "CM Labels",
+                      labelOptions = labelOptions(
+                        style = list("font-weight" = "normal", "font-family" = "Arial", color = "white"),
+                        noHide = TRUE,
+                        textOnly = TRUE,
+                        direction = "center",
+                        opacity = 1)) %>%
+  hideGroup("CM Labels") %>%
+  addPolygons(data = single_zips, color = "green", fillOpacity = 0.25, weight = 2, 
+              label = single_zips$label,
+              group = "Contained Zip Codes") %>%
+  addPolygons(data = multi_zips, color = "red", fillOpacity = 0.25, weight = 2, 
+              label = multi_zips$label,
+              group = "Split Zip Codes") %>%
+  addLayersControl(overlayGroups = c("Contained Zip Codes", "Split Zip Codes", "CM Labels"),
+                   options = layersControlOptions(collapsed = F)) %>%
+  addTiles()
+```
+
+## So what?
+
+The green zip codes are easy to work with because it is clear which Community Ministry is responsible for working with the people who live there. For example, zip code 40212 is fully within Sister Visitor's service area, so any eviction that happens there would be routed to Sister Visitor.
+
+The red areas are divided across multiple Community Ministry, which makes things complicated. For example, 40211 is mostly within West Louisville Community Ministries, but partly within Sister Visitor, too. So if all we know is that 100 evictions happened in 40211, many of those were in West Louisville's service area and how many were in Sister Visitor's service area?
+
+Without more data, we can't know for sure--but we can make a pretty good guess. Of the 21,000 people living in the 40211 zip code, around 15,000 of them live within West Louisville Community Ministry's service area, and around 6,000 live in Sister Visitor's Service area. If we assume evictions are spead out in the same way, that would mean 72 out of 100 evictions in 40211 occurred in WLCM and 28 out of 100 occurred in SV.
+
+The actual breakdown is likely different, because evictions aren't uniform. Perhaps the actual breakdown was 50/50, or 80/20. Without more data, we can't know. But, let's keep our eye on the prize. Our goal isn't to measure *exactly* the distribution of evictions...our goal is to understand how need is spread across Community Ministry areas to inform how resources should be directed. So the question isn't "how can we become 100% correct?" The goal is to answer the question and figure out whether the answer is good enough.
+
+```{r}
+
+leaflet() %>%
+  addPolygons(data = filter(ministries, ministry %in% c("Sister Visitor Center", "West Louisville Community Ministries")), 
+                            color = these_shades[c(10,13)], fillColor = these_shades[c(10,13)], fillOpacity = 0.8, weight = 4) %>%
+  addLabelOnlyMarkers(data = st_centroid(filter(ministries, ministry %in% c("Sister Visitor Center", "West Louisville Community Ministries"))), 
+                      label = ministry_labels[c(10,13)],
+                      group = "CM Labels",
+                      labelOptions = labelOptions(
+                        style = list("font-weight" = "normal", "font-family" = "Arial", color = "white"),
+                        noHide = TRUE,
+                        textOnly = TRUE,
+                        direction = "center",
+                        opacity = 1)) %>%
+  hideGroup("CM Labels") %>%
+  addPolygons(data = filter(single_zips, zip == "40212"), color = "green", fillOpacity = 0.25, weight = 2, 
+              label = filter(single_zips, zip == "40212") %>% pull(label),
+              group = "Contained Zip Codes") %>%
+  addPolygons(data = filter(multi_zips, zip %in% "40211"), color = "red", fillOpacity = 0.25, weight = 2, 
+              label = filter(multi_zips, zip %in% "40211") %>% pull(label),
+              group = "Split Zip Codes") %>%
+  addLayersControl(overlayGroups = c("Contained Zip Codes", "Split Zip Codes", "CM Labels"),
+                   options = layersControlOptions(collapsed = F)) %>%
+  addTiles()
+```
+
+## Many zip codes aren't actually a problem
+
+Without going into details, I used data on where people *actually* live to translate from zip codes to Community Ministry Areas. I started with a virtual map of all 10,986 blocks in Louisville, laid it on top of a virtual map of zip codes and a virtual map of Community Ministry service areas, and calculated what percent of people in each zip code live in each Community Ministry's service area.
+
+Many zip codes are only divided across Ministries by a small sliver or by areas where not many people live. The zip codes below are actually pretty straightforward. (I'll still use the divisions between them, but I'm not going to poke at them by hand.)
+
+```{r}
+pick_a_zip(c(40245, 40243, 40299, 40219, 40219, 40291))
+```
+
+## The 5 problem children {.tabset}
+
+### All 5
+
+That only leaves us with 5 zip codes that might throw things off:
+
+```{r}
+
+zip_codes$n[zip_codes$zip %in% c(40245, 40243, 40299, 40219, 40219, 40291)] <- 1
+
+single_zips <- zip_codes %>% filter(n==1)
+multi_zips <- zip_codes %>% filter(n>1)
+
+zip_ministry %<>%
+  mutate(
+    uncertain = case_when(
+      zip_pct_in_ministry == 1 ~ FALSE,
+      zip %in% c(40245, 40243, 40299, 40219, 40219, 40291) ~ FALSE,
+      TRUE ~ TRUE))
+
+
+leaflet() %>%
+  addPolygons(data = ministries, color = these_shades, fillColor = these_shades, fillOpacity = 0.8, weight = 4) %>%
+  addLabelOnlyMarkers(data = st_centroid(ministries), label = ministry_labels,
+                      group = "CM Labels",
+                      labelOptions = labelOptions(
+                        style = list("font-weight" = "normal", "font-family" = "Arial", color = "white"),
+                        noHide = TRUE,
+                        textOnly = TRUE,
+                        direction = "center",
+                        opacity = 1)) %>%
+  hideGroup("CM Labels") %>%
+  addPolygons(data = single_zips, color = "green", fillOpacity = 0.25, weight = 2, 
+              label = single_zips$label,
+              group = "Contained Zip Codes") %>%
+  addPolygons(data = multi_zips, color = "red", fillOpacity = 0.25, weight = 2, 
+              label = multi_zips$label,
+              group = "Split Zip Codes") %>%
+  addLayersControl(overlayGroups = c("Contained Zip Codes", "Split Zip Codes", "CM Labels"),
+                   options = layersControlOptions(collapsed = F)) %>%
+  addTiles()
+
+```
+
+### 40211
+
+The 40211 zip code is mainly in the West Louisville area, but 28% is in Sister Visitor.
+
+```{r}
+pick_a_zip(40211)
+```
+
+### 40203
+
+40203 is a very odd zip code that is split between Sister Visitor and Central Louisville CM.
+
+```{r}
+pick_a_zip(40203)
+```
+
+### 40208
+
+40208 extends down into SLCM.
+
+```{r}
+pick_a_zip(40208)
+```
+
+### 40218
+
+40218 is divided up across several different CMs.
+
+```{r}
+pick_a_zip(40218)
+```
+
+### 40220
+
+40220 is split between Eastern and Jtown AMs.
+
+```{r}
+pick_a_zip(40220)
+```
+
+# LG&E Disconnections
+
+The best way to figure out whether this is going to be a problem is to get into the data.
+
+Let's look at utility disconnections from 2023. There were around 45,000 disconnections in Jefferson County reported by LG&E in 2023. This map shows where those disconnections occurred. The shading shows the number of disconnections per 100 people. (Per household would make more sense, but I didn't have that data on hand. We're not making any decisions based on this data, just getting an understanding.) You can mouse over the map to see the total number within each zip code.
+
+This lines up with what you would expect: some zip codes have much higher rates of disconnection than others.
+
+## Rate by Zip Code
+
+### Disconnections
+
+```{r}
+utility_data <- read_csv("utilities.csv")
+
+utility_data %<>%
+  transmute(zip = as.character(ZIP),
+            brown_bills = `Brown Bills`,
+            disconnections = Disconnections)
+
+utility_data %<>%
+  left_join(FIPS_zip, by = "zip") %>%
+  mutate(
+    disconnections = disconnections * pct_pop_in_county / 100,
+    brown_bills = brown_bills * pct_pop_in_county / 100) %>%
+  filter(zip %in% zip_codes$zip)
+
+
+zip_pop <- block_zip_ministry_sum %>%
+  group_by(zip) %>%
+  reframe(people = sum(people_in_here, na.rm=TRUE))
+
+zip_codes %<>%
+  left_join(utility_data, by = "zip") %>%
+  left_join(zip_pop, by = "zip") %>%
+  mutate(
+    discon_p100 = disconnections / people * 100,
+    brown_bill_p100 = brown_bills / people * 100)
+
+#Get total number
+#zip_codes %>% distinct(zip, .keep_all = TRUE) %>% pull(disconnections) %>% sum(na.rm = TRUE)
+
+pal <- leaflet::colorNumeric(
+  palette = RColorBrewer::brewer.pal(9, "BuPu"),
+  domain = range(zip_codes$discon_p100, na.rm = TRUE))
+
+leaflet(zip_codes) %>%
+  addPolygons(
+    color = "#444444", weight = 1, smoothFactor = 0.5, opacity = 1.0, fillOpacity = 0.5,
+    label = paste0("Total disconnections: ", label_comma(accuracy = 1)(zip_codes$disconnections)),
+    fillColor = ~pal(discon_p100)) %>%
+    addLegend(
+      pal = pal, 
+      values = range(zip_codes$discon_p100, na.rm = TRUE), 
+      opacity = 0.7, 
+      title = "Disconnections per 100 people",
+      position = "bottomright") %>%
+  addTiles()
+
+
+```
+
+### Brown Bills
+
+(This is a notice.)
+
+```{r}
+pal <- leaflet::colorNumeric(
+  palette = RColorBrewer::brewer.pal(9, "BuPu"),
+  domain = range(zip_codes$brown_bill_p100, na.rm = TRUE))
+
+leaflet(zip_codes) %>%
+  addPolygons(
+    color = "#444444", weight = 1, smoothFactor = 0.5, opacity = 1.0, fillOpacity = 0.5,
+    label = paste0("Total Brown Bills: ", label_comma(accuracy = 1)(zip_codes$brown_bills)),
+    fillColor = ~pal(brown_bill_p100)) %>%
+    addLegend(
+      pal = pal, 
+      values = range(zip_codes$brown_bill_p100, na.rm = TRUE), 
+      opacity = 0.7, 
+      title = "Brown Bills per 100 people",
+      position = "bottomright") %>%
+  addTiles()
+
+```
+
+## Actual Disconnections
+
+I haven't included a map that is shaded by the total number of disconnections by zip code since some zip codes have way more people than others, so it will just show us where people live.
+
+A better way to get a sense is by ditching the zip codes entirely. On the map below, every dot represents 10 disconnections. (They are randomly placed within their zip code since I don't have an exact address.)
+
+Some parts of our city are much more populated and spread out, so they have many fewer dots. But there are a lot, everywhere.
+
+```{r}
+
+# pal <- leaflet::colorNumeric(
+#   palette = RColorBrewer::brewer.pal(9, "BuPu"),
+#   domain = range(zip_codes$disconnections, na.rm = TRUE))
+# 
+# leaflet(zip_codes) %>%
+#   addPolygons(
+#     color = "#444444", weight = 1, smoothFactor = 0.5, opacity = 1.0, fillOpacity = 0.5,
+#     label = paste0("Total disconnections: ", label_comma(accuracy = 1)(zip_codes$disconnections)),
+#     fillColor = ~pal(disconnections)) %>%
+#     addLegend(
+#       pal = pal, 
+#       values = range(zip_codes$disconnections, na.rm = TRUE), 
+#       opacity = 0.7, 
+#       title = "Disconnections per 100 people",
+#       position = "bottomright") %>%
+#   addTiles()
+
+
+points <- st_as_sf(sf::st_sample(zip_codes[1,], size = as.integer(zip_codes[[1,"disconnections"]] / 10)))
+
+for(i in 2:nrow(zip_codes)) {
+  if(!is.na(zip_codes[[i,"disconnections"]])) {
+    if(zip_codes[[i,"disconnections"]] >0) {
+      
+      temp <- st_as_sf(sf::st_sample(zip_codes[i,], size = as.integer(zip_codes[[i,"disconnections"]] / 10)))
+      
+      points %<>% bind_rows(temp)
+    }
+  }
+}
+
+jc = glptools::map_county %>% filter(FIPS == "21111")
+
+plot_points <- 
+  st_jitter(points, factor = 0.01) 
+
+within <- as.logical(st_within(plot_points, jc))
+
+plot_points %<>% filter(within)
+
+leaflet(plot_points) %>%
+  addCircleMarkers(
+    radius = 2,
+    stroke = FALSE) %>%
+  addPolygons(
+    data = zip_codes,
+    color = "#444444", weight = 1, smoothFactor = 0.5, opacity = 1.0, fillOpacity = 0) %>%
+  addTiles()
+
+```
+
+## Rate by Community Ministry {.tabset}
+
+### Disconnections
+
+If we look at the rate of disconnection by Community Ministry, we can see that residents in some experience much higher rates of disconnection than in others. For example, Sister Visitor Center has the highest rate of disconnections at 12.6 per 100 residents. Eastern Area Community Ministries rate is much lower, at 3.9 per 100 residents. 
+
+But, we should also note that the number of residents in each Community Ministry is also very different. Over 5x as many people live in the service area of Eastern Area Community Ministries than in Sister Visitor, so *more* disconnections actually occurred within EACM than in the service area of SVC.
+
+```{r}
+
+zip_ministry_crosswalk <- zip_ministry %>%
+  select(zip, ministry, zip_pct_in_ministry)
+
+utility_data_ministry <- utility_data %>%
+  left_join(zip_ministry_crosswalk, by = "zip")
+
+utility_data_ministry_regular <- utility_data_ministry %>%
+  mutate(
+    disconnections = disconnections * zip_pct_in_ministry,
+    brown_bills = brown_bills * zip_pct_in_ministry) %>%
+  group_by(ministry) %>%
+  reframe(
+    disconnections = sum(disconnections, na.rm=TRUE),
+    brown_bills = sum(brown_bills, na.rm=TRUE))
+
+ministry_pop <- block_zip_ministry_sum %>%
+  group_by(ministry) %>%
+  reframe(people = sum(people_in_here, na.rm = TRUE))
+
+utility_data_ministry_regular %<>%
+  left_join(ministry_pop, by = "ministry") %>%
+  mutate(
+    discon_p100 = disconnections / people * 100,
+    brown_bill_p100 = brown_bills / people * 100)
+
+ministries %<>% 
+  left_join(utility_data_ministry_regular, by = "ministry")
+
+pal <- leaflet::colorNumeric(
+  palette = RColorBrewer::brewer.pal(9, "BuPu"),
+  domain = range(ministries$discon_p100, na.rm = TRUE))
+
+leaflet(ministries) %>%
+  addPolygons(
+    color = "#444444", weight = 1, smoothFactor = 0.5, opacity = 1.0, fillOpacity = 0.5,
+    label = paste0("Total disconnections: ", label_comma(accuracy = 1)(ministries$disconnections)),
+    fillColor = ~pal(discon_p100)) %>%
+    addLegend(
+      pal = pal, 
+      values = range(ministries$discon_p100, na.rm = TRUE), 
+      opacity = 0.7, 
+      title = "Disconnections per 100 people",
+      position = "bottomright") %>%
+  addTiles()
+
+
+
+```
+
+### Brown Bills
+
+```{r}
+
+pal <- leaflet::colorNumeric(
+  palette = RColorBrewer::brewer.pal(9, "BuPu"),
+  domain = range(ministries$brown_bill_p100, na.rm = TRUE))
+
+leaflet(ministries) %>%
+  addPolygons(
+    color = "#444444", weight = 1, smoothFactor = 0.5, opacity = 1.0, fillOpacity = 0.5,
+    label = paste0("Total brown bills: ", label_comma(accuracy = 1)(ministries$brown_bills)),
+    fillColor = ~pal(brown_bill_p100)) %>%
+    addLegend(
+      pal = pal, 
+      values = range(ministries$brown_bill_p100, na.rm = TRUE), 
+      opacity = 0.7, 
+      title = "Disconnections per 100 people",
+      position = "bottomright") %>%
+  addTiles()
+
+```
+
+
+## Totals by Community Ministry {.tabset}
+
+### Disconnections
+
+This map is shaded based on the *total* number of disconnections.
+
+```{r}
+
+pal <- leaflet::colorNumeric(
+  palette = RColorBrewer::brewer.pal(9, "BuPu"),
+  domain = range(ministries$disconnections, na.rm = TRUE))
+
+
+leaflet(ministries) %>%
+  addPolygons(
+    color = "#444444", weight = 1, smoothFactor = 0.5, opacity = 1.0, fillOpacity = 0.5,
+    label = paste0("Total disconnections: ", label_comma(accuracy = 1)(ministries$disconnections)),
+    fillColor = ~pal(disconnections)) %>%
+    addLegend(
+      pal = pal, 
+      values = range(ministries$disconnections, na.rm = TRUE), 
+      opacity = 0.7, 
+      title = "Disconnections",
+      position = "bottomright") %>%
+  addTiles()
+
+```
+
+### Brown Bills
+
+```{r}
+
+
+pal <- leaflet::colorNumeric(
+  palette = RColorBrewer::brewer.pal(9, "BuPu"),
+  domain = range(ministries$brown_bills, na.rm = TRUE))
+
+
+leaflet(ministries) %>%
+  addPolygons(
+    color = "#444444", weight = 1, smoothFactor = 0.5, opacity = 1.0, fillOpacity = 0.5,
+    label = paste0("Total brown bills: ", label_comma(accuracy = 1)(ministries$brown_bills)),
+    fillColor = ~pal(brown_bills)) %>%
+    addLegend(
+      pal = pal, 
+      values = range(ministries$brown_bills, na.rm = TRUE), 
+      opacity = 0.7, 
+      title = "Disconnections",
+      position = "bottomright") %>%
+  addTiles()
+
+```
+
+# Evictions {.tabset}
+
+This data is from January 1 to March 31 2024.
+
+```{r get_data, eval = FALSE}
+library(googlesheets4)
+
+#eviction_2023_id <- as_sheets_id("https://docs.google.com/spreadsheets/d/1xu4Bb9TwnUkf4S6KMySqfQRAZCfBC1VmrB7nVihWuW8/edit#gid=1024146624")
+eviction_2024_id <- as_sheets_id("https://docs.google.com/spreadsheets/d/1LK7_w91hED681lfyyDVoldfh9Ih10rafUGSVsDwubLk/edit#gid=2135820535")
+
+eviction_2024_info <- googlesheets4::gs4_get(eviction_2024_id)
+
+eviction_2024_sheets <- eviction_2024_info$sheets
+
+for(i in 7:25) {
+  
+  sheet_name = eviction_2024_sheets$name[i]
+  
+  print(paste0(i, ":  ", sheet_name))
+  
+  skip_row <- if_else(i %in% c(9, 10, 17, 18), 1, 0)
+  
+  temp_download <- read_sheet(eviction_2024_id, sheet = sheet_name, skip = skip_row)
+  
+  temp_download$sheet_name <- sheet_name
+  
+  temp_download <- as_tibble(temp_download)
+  
+  if (i %in% 7:8) {
+    
+    temp_download %<>%
+      transmute(
+        zip = as.character(as.numeric(`ZIP\nCODE`)),
+        ministry = ACM,
+        case = `CASE #`,
+        date = `COURT\nDATE`,
+        tenant = `TENANT\nNAME`,
+        rent = as.numeric(as.character(`MONTHLY RENT`)),
+        amount_owed = as.numeric(as.character(`Amount owed`)))
+    
+  } else if (i %in% c(9:11, 14)) {
+    
+    temp_download %<>%
+      transmute(
+        zip = as.character(as.numeric(`ZIP\nCODE`)),
+        ministry = ACM,
+        case = `CASE #`,
+        date = `COURT\nDATE`,
+        tenant = `TENANT\nNAME`,
+        rent = as.numeric(as.character(`MONTHLY RENT`)),
+        amount_owed = as.numeric(as.character(`Amount owed`)))
+
+  } else if (i %in% c(12, 16:22)) {
+    
+    temp_download %<>%
+      transmute(
+        zip = as.character(as.numeric(`ZIP\nCODE`)),
+        ministry = ACM,
+        case = `CASE #`,
+        date = `COURT\nDATE`,
+        tenant = `TENANT\nNAME`,
+        rent = as.numeric(as.character(`Monthly Rent`)),
+        amount_owed = as.numeric(as.character(`Amount owed`)))
+
+  } else if (i %in% c(13,15)) {
+    
+    temp_download %<>%
+      transmute(
+        zip = as.character(as.numeric(`ZIP\nCODE`)),
+        ministry = ACM,
+        case = `CASE #`,
+        date = `COURT\nDATE`,
+        tenant = `TENANT\nNAME`,
+        rent = as.numeric(as.character(`This GREEN = Tina would like to have access to this info that AOC has but Tina doesn't have access to\n\n\n\nMONTHLY RENT`)),
+        amount_owed = as.numeric(as.character(`Amount owed`)))
+
+  } else if (i %in% c(23:25)) {
+    
+    temp_download %<>%
+      transmute(
+        zip = as.character(as.numeric(as.character(`ZIP\nCODE`))),
+        ministry = ACM,
+        case = `CASE #`,
+        date = as.Date(as.character(`COURT\nDATE`)),
+        tenant = `TENANT\nNAME`,
+        rent = as.numeric(as.character(`Monthly Rent`)),
+        amount_owed = as.numeric(as.character(`Amount owed`)))
+
+  }
+  
+  if(i==7) {
+    
+    output = temp_download
+    
+  } else {
+    
+    output <- bind_rows(output, temp_download)
+    
+  }
+    
+  
+}
+
+save(output, file = "eviction_download_2024_04_22.RData")
+```
+
+```{r}
+
+load("eviction_download_2024_04_22.RData")
+
+#eviction_data_pdf <- readxl::read_excel("Eviction PDF Data.xlsx", sheet = )
+
+eviction_data_2024 <- output
+
+eviction_data_2024 %<>%
+  transmute(
+    zip,
+    ministry,
+    case,
+    date,
+    tenant,
+    rent = if_else(rent < 0 | rent > 10000, NA, rent),
+    amount_owed = if_else(amount_owed < 0, NA, amount_owed))
+
+eviction_data_2024 %<>% 
+  filter(
+    date > lubridate::ymd("2024-01-01"),
+    date < lubridate::ymd("2024-03-31")) %>%
+  group_by(case) %>%
+  filter(row_number() == max(row_number())) %>%
+  filter(!str_detect(tenant, "LLC")) %>%
+  ungroup()
+
+```
+
+## Rate
+
+```{r}
+eviction_data_ministry <- eviction_data_2024 %>%
+  group_by(zip) %>%
+  reframe(
+    evictions = n(),
+    rent_owed = sum(amount_owed, na.rm = TRUE)) %>%
+  left_join(zip_ministry_crosswalk, by = "zip")
+
+eviction_data_ministry %<>%
+  mutate(
+    evictions = evictions * zip_pct_in_ministry,
+    rent_owed = rent_owed * zip_pct_in_ministry) %>%
+  group_by(ministry) %>%
+  reframe(
+    evictions = sum(evictions, na.rm=TRUE),
+    rent_owed = sum(rent_owed, na.rm=TRUE))
+
+ministry_pop <- block_zip_ministry_sum %>%
+  group_by(ministry) %>%
+  reframe(people = sum(people_in_here, na.rm = TRUE))
+
+eviction_data_ministry %<>%
+  left_join(ministry_pop, by = "ministry") %>%
+  mutate(
+    eviction_p100 = evictions / people * 100,
+    rent_p100 = rent_owed / people * 100) %>%
+  select(-people)
+
+ministries %<>% 
+  left_join(eviction_data_ministry, by = "ministry")
+
+pal <- leaflet::colorNumeric(
+  palette = RColorBrewer::brewer.pal(9, "BuPu"),
+  domain = range(ministries$eviction_p100, na.rm = TRUE))
+
+leaflet(ministries) %>%
+  addPolygons(
+    color = "#444444", weight = 1, smoothFactor = 0.5, opacity = 1.0, fillOpacity = 0.5,
+    label = paste0("Total evictions: ", label_comma(accuracy = 1)(ministries$evictions)),
+    fillColor = ~pal(eviction_p100)) %>%
+    addLegend(
+      pal = pal, 
+      values = range(ministries$eviction_p100, na.rm = TRUE), 
+      opacity = 0.7, 
+      title = "Evictions per 100 people",
+      position = "bottomright") %>%
+  addTiles()
+
+
+
+```
+
+## Totals
+
+```{r}
+
+pal <- leaflet::colorNumeric(
+  palette = RColorBrewer::brewer.pal(9, "BuPu"),
+  domain = range(ministries$evictions, na.rm = TRUE))
+
+leaflet(ministries) %>%
+  addPolygons(
+    color = "#444444", weight = 1, smoothFactor = 0.5, opacity = 1.0, fillOpacity = 0.5,
+    label = paste0("Total evictions: ", label_comma(accuracy = 1)(ministries$evictions)),
+    fillColor = ~pal(evictions)) %>%
+    addLegend(
+      pal = pal, 
+      values = range(ministries$evictions, na.rm = TRUE), 
+      opacity = 0.7, 
+      title = "Evictions",
+      position = "bottomright") %>%
+  addTiles()
+
+
+```
+
+# Revisiting zip codes: How wrong could we be?
+
+I walked through a hypothetical question to understand what kind of error is possible as we try to translate zip codes to Community Ministry service area.
+
+The question I asked is "What if residents in the same zip code in one Community Ministry area are twice as likely to experience disconnections as residents who live in the same zip code but a different Community Ministry?"
+
+It's tough to understand just from the question, but I think an example makes it easy to wrap your head around. Imagine a zip code with 600 residents divided evenly between two Ministries, so that 300 residents live in Ministry A and 300 live in Ministry B.
+
+Let's say there were 60 disconnections in that zip code (10% of households). If the disconnections are distributed equally, then 30 disconnections occurred in Ministry A and 30 occurred in Ministry B.
+
+Now, imagine residents in Ministry A are twice as likely to experience a disconnection as those in Ministry B. That would mean 40 of the disconnections occurred in Ministry A and 20 occurred in Ministry B. (That breaks down to 13.3% of residents in Ministry A experiencing a disconnection and 6.7% of residents in Ministry B experiencing a disconnection.) If we extend this idea to our actual data, we can figure out how wrong we might we be in practice. The chart below shows the results.
+
+In the chart, the dots represent the number of disconnections that occurred in each Community Ministry area. The lines show a reasonable guess for a "range." The top of the line shows where the math would lead if we assume disconnections are twice as likely to happen in that Community Ministry Area compared to everywhere else, and the bottom of the line shows what if disconnections were half as likely.
+
+For some Ministries, the results don't change. That is because their boundaries line up perfectly with zip codes, so there is no "wiggle room" in the data.
+
+The Ministries with the most room for error are West Louisville Community Ministries, Sister Visitor Center, and Central Louisville Community Ministries. That is because the three of them share large zip codes with large numbers of disconnections. So, if Sister Visitor Center were twice as likely to see disconnections as the other two, then we might be underestimating disconnections in SVC and overestimating disconnections in WLCM and CLCM.
+
+```{r}
+
+zip_ministry_crosswalk <- zip_ministry %>%
+  select(-uncertain)
+
+utility_data_ministry <- utility_data %>%
+  left_join(zip_ministry_crosswalk, by = "zip") %>%
+  mutate(disconnections = replace_na(disconnections, 0)) %>%
+  filter(!is.na(FIPS))
+
+## Weird math. Ask "What if disconnections were 3x as likely to occur in one CM compared to others?"
+
+THESE_ODDS <- 2
+
+for(m in 1:nrow(ministries)) {
+  
+  # 1. Give this ministry a weight of 3x likelihood to experience disconnection
+  
+  this_ministry = ministries$ministry[m]
+  
+  this_df <- utility_data_ministry %>%
+    mutate(weight = if_else(ministry == this_ministry, THESE_ODDS, 1))
+  
+  # 2. Calculate odds of disconnection for each zip code and multiply one by 3
+  
+  this_df %<>%
+    group_by(zip) %>%
+    mutate(
+      regular_odds = unique(disconnections) / sum(people),
+      weighted_odds = regular_odds * weight)
+  
+  # 3. Rebalance disconnections
+  
+  this_df %<>%
+    mutate(
+      
+      # Calculate total disconnections based on weighted odds
+      suggested_disconnections = people * weighted_odds,
+      
+      # Since we scaled up one odds, we have more disconnections. Scale down to match observations.
+      scaled_disconnections = suggested_disconnections * disconnections / sum(suggested_disconnections),
+    )
+  
+  this_df %<>%
+    filter(ministry == this_ministry)
+  
+  output_df_high <- assign_row_join(output_df_high, this_df)
+  
+}
+
+## Weird math. Ask "What if disconnections were 3x as likely to occur in one CM compared to others?"
+
+for(m in 1:nrow(ministries)) {
+  
+  # 1. Give this ministry a weight of 3x likelihood to experience disconnection
+  
+  this_ministry = ministries$ministry[m]
+  
+  this_df <- utility_data_ministry %>%
+    mutate(weight = if_else(ministry == this_ministry, 1/THESE_ODDS, 1))
+  
+  # 2. Calculate odds of disconnection for each zip code and multiply one by 3
+  
+  this_df %<>%
+    group_by(zip) %>%
+    mutate(
+      regular_odds = unique(disconnections) / sum(people),
+      weighted_odds = regular_odds * weight)
+  
+  # 3. Rebalance disconnections
+  
+  this_df %<>%
+    mutate(
+      
+      # Calculate total disconnections based on weighted odds
+      suggested_disconnections = people * weighted_odds,
+      
+      # Since we scaled up one odds, we have more disconnections. Scale down to match observations.
+      scaled_disconnections = suggested_disconnections * disconnections / sum(suggested_disconnections),
+    )
+  
+  this_df %<>%
+    filter(ministry == this_ministry)
+  
+  output_df_low <- assign_row_join(output_df_low, this_df)
+  
+}
+
+output_df_high %<>%
+  ungroup() %>%
+  group_by(ministry) %>%
+  reframe(
+    disconnections_high = sum(scaled_disconnections, na.rm = TRUE))
+
+output_df_low %<>%
+  ungroup() %>%
+  group_by(ministry) %>%
+  reframe(
+    disconnections_low = sum(scaled_disconnections, na.rm = TRUE))
+
+```
+
+```{r}
+
+utility_data_ministry_all <- utility_data_ministry_regular %>%
+  left_join(output_df_low, by = "ministry") %>%
+  left_join(output_df_high, by = "ministry")
+
+utility_data_ministry_all %<>%
+  mutate(low_pct = disconnections_low / disconnections * 100,
+         high_pct = disconnections_high / disconnections * 100)
+
+```
+
+```{r graph_error, fig.width=9, fig.height=6}
+
+# ggplot(utility_data_ministry_all,
+#          aes(x = ministry, y = 100, ymin = low_pct, ymax = high_pct)) +
+#   geom_point(position=position_dodge(width=0.5) ,size = 2.5) + 
+#   geom_linerange(position=position_dodge(width=0.5), size =0.5) + 
+#   theme_bw() + 
+#   ylim(0, 130) +
+#   xlab("Community Ministry") + 
+#   ylab("Range") + 
+#   labs(title = "How Wrong Could We Be?",
+#        subtitle = "What is the error?") + 
+#   theme(
+#     legend.title = element_blank(),
+#     axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+ggplot(utility_data_ministry_all,
+         aes(x = ministry, y = disconnections, ymin = disconnections_low, ymax = disconnections_high)) +
+  geom_point(position=position_dodge(width=0.5) ,size = 2.5) + 
+  geom_linerange(position=position_dodge(width=0.5), size =0.5) + 
+  theme_bw() + 
+  ylim(0, 8000) +
+  xlab("Community Ministry") + 
+  ylab("Disconnections") + 
+  labs(title = "How Wrong Could We Be?",
+       subtitle = "What is the error?") + 
+  theme(
+    legend.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+
+```
+
+## The point
+
+So, it looks like there is some room for error in the math.
+
+One thing to point out is that the uncertainty we see is between neighboring Ministries. For example, zip code 40211 is split between SVC and WLCM. If we underestimated in one by 100 people, then we overestimated in the other by 100 people. There is no way that those disconnections could be "misallocated" to any of the other 11 ministries.
+
+# Funding
+
+Here's what the funding would look like appropriatede based on these findings:
+
+```{r}
+ministry_funding <- readxl::read_excel("Ministry Data.xlsx")
+
+ministries %<>%
+  left_join(ministry_funding, by = c("ministry" = "Ministry"))
+
+ministries %<>%
+  mutate(
+    funding_actual = Funding,
+    funding_suggested1 = disconnections / sum(disconnections) * sum(Funding),
+    funding_suggested2 = brown_bills / sum(brown_bills) * sum(Funding),
+    funding_suggested3 = evictions / sum(evictions) * sum(Funding))
+  
+```
+
+
+```{r}
+
+library(reactable)
+
+ministry_table <- ministries %>%
+  select(
+    ministry, 
+    people, 
+    disconnections,
+    discon_p100,
+    funding_actual,
+    funding_suggested1,
+    funding_suggested2,
+    funding_suggested3) %>%
+  st_drop_geometry()
+
+ministry_table_clean <- ministry_table %>%
+  rename(
+    Ministry = ministry,
+    Residents = people,
+    Disconnections = disconnections)
+
+#downloadthis::download_this("Ministry Data" = ministry_table_clean)
+
+reactable(
+  ministry_table,
+  columns = list(
+    ministry = colDef(name = "Ministry"),
+    people = colDef(name = "Residents", format = colFormat(separators = TRUE, digits = 0)),
+    disconnections = colDef(name = "#", format = colFormat(separators = TRUE, digits = 0)),
+    discon_p100 = colDef(name = "Per 100", format = colFormat(separators = TRUE, digits = 1)),
+    funding_actual = colDef(name = "Current Funding", format = colFormat(separators = TRUE, prefix = "$", digits = 0)),
+    funding_suggested1 = colDef(name = "Disconnections", format = colFormat(separators = TRUE, prefix = "$", digits = 0)),
+    funding_suggested2 = colDef(name = "Brown Bills", format = colFormat(separators = TRUE, prefix = "$", digits = 0)),
+    funding_suggested3 = colDef(name = "Evictions", format = colFormat(separators = TRUE, prefix = "$", digits = 0))),
+  columnGroups = list(
+    colGroup(name = "LG&E Disconnections", columns = c("disconnections", "discon_p100")),
+    colGroup(name = "Funding", columns = c("funding_actual", "funding_suggested1", "funding_suggested2", "funding_suggested3"))),
+  striped = TRUE,
+  theme = reactableTheme(
+    stripedColor = "#f6f8fa"
+  ),
+  showPageSizeOptions = FALSE,
+  defaultPageSize = 13)
+
+
+```
+
