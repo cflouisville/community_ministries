@@ -1129,3 +1129,105 @@ reactable(
 
 ```
 
+# Population change
+
+Another piece of the puzzle is population change. My understanding is that the current allocation have just been scaled down since the amounts were decided around 10 years ago, so some diverging population growth would help explain why funding has drifted away from other metrics.
+
+```{r}
+
+population_05_5yr    <- build_census_var_df("acs5", "B01001", age_groups = "all")
+
+population_05_5yr %<>%
+  filter(race=="total", sex=="total")
+
+zip_pop <- get_census(population_05_5yr, "zip", var_name = "population")
+
+t=zip_pop
+
+zip_pop %<>%
+  left_join(FIPS_zip, by = "zip")
+
+zip_pop %<>%
+  filter(FIPS == "21111")
+
+zip_pop %<>%
+  filter(var_type == "estimate") %>%
+  mutate(
+    year = year + 2,
+    population = population * pct_pop_in_county / 100)
+
+zip_pop_change <- zip_pop %>%
+  group_by(zip) %>%
+  mutate(total_pop = sum(population, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(zip)  %>%
+  mutate(
+    #population_change is % change
+    population_change = (population - first(population)) / first(population) * 100,
+
+    #population_change_adj is % change - county-wide % change
+    population_change_adj =
+      population_change -
+      ((total_pop - first(total_pop))/first(total_pop) * 100)) %>%
+  ungroup() %>%
+  select(-total_pop) %>%
+  mutate(
+    population_change = if_else(population_change == Inf | is.nan(population_change), NA_real_, population_change),
+    population_change_adj = if_else(population_change_adj == Inf| is.nan(population_change_adj), NA_real_, population_change_adj))
+
+cm_pop <- zip_pop %>%
+  select(zip, year, population) %>%
+  left_join(zip_ministry_crosswalk, by = "zip") %>%
+  mutate(population = population * zip_pct_in_ministry) %>%
+  group_by(ministry, year) %>%
+  reframe(population = sum(population, na.rm=TRUE))
+
+cm_pop_change <- cm_pop %>%
+  group_by(year) %>%
+  mutate(total_pop = sum(population, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(ministry)  %>%
+  mutate(
+    #population_change is % change
+    population_change = (population - first(population)) / first(population) * 100,
+
+    #population_change_adj is % change - county-wide % change
+    population_change_adj =
+      population_change -
+      ((total_pop - first(total_pop))/first(total_pop) * 100)) %>%
+  ungroup() %>%
+  select(-total_pop) %>%
+  mutate(
+    population_change = if_else(population_change == Inf | is.nan(population_change), NA_real_, population_change),
+    population_change_adj = if_else(population_change_adj == Inf| is.nan(population_change_adj), NA_real_, population_change_adj)) %>%
+  filter(year == 2022) %>%
+  select(-year, -population)
+
+ministries %<>%
+  left_join(cm_pop_change, by = "ministry")
+
+
+pal <- 
+  leaflet::colorNumeric(
+    palette = RColorBrewer::brewer.pal(11, "RdYlGn"),
+    domain = range(ministries$population_change))
+
+leaflet(ministries) %>%
+  addPolygons(
+    color = "#444444", weight = 1, smoothFactor = 0.5, opacity = 1.0, fillOpacity = 0.5,
+    label = paste0("Population Change 2011 to 2022: ", label_percent(accuracy = 0.1)(ministries$population_change / 100)),
+    fillColor = ~pal(population_change)) %>%
+    addLegend(
+      pal = pal, 
+      values = range(ministries$population_change), 
+      opacity = 0.7, 
+      title = "Population Change",
+      position = "bottomright") %>%
+  addTiles()
+  
+```
+
+
+
+
+
